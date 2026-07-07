@@ -16,14 +16,15 @@ function corsHeaders(origin) {
   }
 }
 
-function buildPrompt({ fullName, jobTitle, skills, experienceSummary, companyName, jobDescription }) {
+function buildPrompt({ fullName, jobTitle, profileText, companyName, jobDescription }) {
   return `You are a professional career writing assistant. Write a concise, tailored cover letter based on the details below.
 
 Candidate name: ${fullName}
 Target role: ${jobTitle}
 Company: ${companyName || 'the company'}
-Candidate's key skills: ${skills}
-Candidate's experience summary: ${experienceSummary}
+
+Candidate's CV / background (may be raw text extracted from a document, or a structured summary — treat it as the source of truth for their skills and experience):
+${profileText}
 
 Job description / posting details:
 ${jobDescription}
@@ -34,8 +35,9 @@ Write the cover letter in exactly three paragraphs:
 3. A short closing paragraph expressing interest in an interview.
 
 Rules:
-- Do not invent facts, numbers, or experience not provided above.
+- Do not invent facts, numbers, or experience not present in the candidate's CV/background above.
 - Do not use placeholder brackets like [Company Name] — use the real values given.
+- If the CV/background text is messy (e.g. extracted from a PDF), extract the relevant facts and ignore formatting artifacts, headers, or page numbers.
 - Keep the tone professional and confident, not flowery.
 - Output only the letter text, no preamble, no markdown formatting, no subject line.`
 }
@@ -65,16 +67,21 @@ export default {
       })
     }
 
-    const { fullName, jobTitle, skills, experienceSummary, companyName, jobDescription } = body
+    const { fullName, jobTitle, profileText, companyName, jobDescription } = body
 
-    if (!fullName || !jobTitle || !skills || !experienceSummary || !jobDescription) {
+    if (!fullName || !jobTitle || !profileText || !jobDescription) {
       return new Response(
         JSON.stringify({ error: 'Missing required fields' }),
         { status: 400, headers: { 'Content-Type': 'application/json', ...corsHeaders(origin) } },
       )
     }
 
-    const prompt = buildPrompt({ fullName, jobTitle, skills, experienceSummary, companyName, jobDescription })
+    // Cap the profile text length — protects against runaway prompt size/cost
+    // from very large uploaded documents, and Gemini doesn't need more than this
+    // to write a focused 3-paragraph letter.
+    const trimmedProfileText = profileText.slice(0, 8000)
+
+    const prompt = buildPrompt({ fullName, jobTitle, profileText: trimmedProfileText, companyName, jobDescription })
 
     try {
       const geminiRes = await fetch(
