@@ -1,0 +1,7 @@
+name = "etiquette-cv-letter"
+main = "src/index.js"
+compatibility_date = "2026-07-01"
+
+# The Gemini key itself is NOT set here — never put secrets in this file,
+# since it gets committed to git. Set it after deploying with:
+#   wrangler secret put GEMINI_API_KEY
