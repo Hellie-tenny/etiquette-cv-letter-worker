@@ -26,7 +26,7 @@ Company: ${companyName || 'the company'}
 Candidate's CV / background (may be raw text extracted from a document, or a structured summary — treat it as the source of truth for their skills and experience):
 ${profileText}
 
-Job description / posting details:
+Job posting (this may be a clean job description, or the full text of a job listing page — including navigation text, "Apply Now" buttons, company boilerplate, cookie notices, or other unrelated page content. Identify and use only the actual role details: responsibilities, requirements, and qualifications. Ignore everything else):
 ${jobDescription}
 
 Write the cover letter in exactly three paragraphs:
@@ -38,6 +38,7 @@ Rules:
 - Do not invent facts, numbers, or experience not present in the candidate's CV/background above.
 - Do not use placeholder brackets like [Company Name] — use the real values given.
 - If the CV/background text is messy (e.g. extracted from a PDF), extract the relevant facts and ignore formatting artifacts, headers, or page numbers.
+- If the job posting text contains unrelated page content (navigation, boilerplate, unrelated postings), extract only the details relevant to this specific role and ignore the rest.
 - Keep the tone professional and confident, not flowery.
 - Output only the letter text, no preamble, no markdown formatting, no subject line.`
 }
@@ -76,12 +77,19 @@ export default {
       )
     }
 
-    // Cap the profile text length — protects against runaway prompt size/cost
-    // from very large uploaded documents, and Gemini doesn't need more than this
-    // to write a focused 3-paragraph letter.
+    // Cap both text inputs — protects against runaway prompt size/cost from
+    // very large uploaded documents or full job listing pages being pasted in.
+    // Gemini doesn't need more than this to write a focused 3-paragraph letter.
     const trimmedProfileText = profileText.slice(0, 8000)
+    const trimmedJobDescription = jobDescription.slice(0, 8000)
 
-    const prompt = buildPrompt({ fullName, jobTitle, profileText: trimmedProfileText, companyName, jobDescription })
+    const prompt = buildPrompt({
+      fullName,
+      jobTitle,
+      profileText: trimmedProfileText,
+      companyName,
+      jobDescription: trimmedJobDescription,
+    })
 
     try {
       const geminiRes = await fetch(
