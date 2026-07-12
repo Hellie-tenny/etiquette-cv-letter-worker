@@ -16,7 +16,7 @@ function corsHeaders(origin) {
   }
 }
 
-function buildPrompt({ fullName, jobTitle, profileText, companyName, jobDescription }) {
+function buildPrompt({ fullName, jobTitle, profileText, companyName, jobDescription, notes }) {
   return `You are a professional career writing assistant. Write a concise, tailored cover letter based on the details below.
 
 Candidate name: ${fullName}
@@ -28,7 +28,7 @@ ${profileText}
 
 Job posting (this may be a clean job description, or the full text of a job listing page — including navigation text, "Apply Now" buttons, company boilerplate, cookie notices, or other unrelated page content. Identify and use only the actual role details: responsibilities, requirements, and qualifications. Ignore everything else):
 ${jobDescription}
-
+${notes ? `\nAdditional instructions from the candidate — follow these unless they conflict with the rules below:\n${notes}\n` : ''}
 Write the cover letter in exactly three paragraphs:
 1. A brief, specific opening stating the role and why the candidate is a strong fit.
 2. A paragraph connecting the candidate's actual experience and skills to the specific requirements in the job description — be concrete, not generic.
@@ -39,7 +39,7 @@ Rules:
 - Do not use placeholder brackets like [Company Name] — use the real values given.
 - If the CV/background text is messy (e.g. extracted from a PDF), extract the relevant facts and ignore formatting artifacts, headers, or page numbers.
 - If the job posting text contains unrelated page content (navigation, boilerplate, unrelated postings), extract only the details relevant to this specific role and ignore the rest.
-- Keep the tone professional and confident, not flowery.
+- Keep the tone professional and confident, not flowery, unless the candidate's additional instructions above say otherwise.
 - Output only the letter text, no preamble, no markdown formatting, no subject line.`
 }
 
@@ -68,7 +68,7 @@ export default {
       })
     }
 
-    const { fullName, jobTitle, profileText, companyName, jobDescription } = body
+    const { fullName, jobTitle, profileText, companyName, jobDescription, notes } = body
 
     if (!fullName || !jobTitle || !profileText || !jobDescription) {
       return new Response(
@@ -77,11 +77,12 @@ export default {
       )
     }
 
-    // Cap both text inputs — protects against runaway prompt size/cost from
-    // very large uploaded documents or full job listing pages being pasted in.
+    // Cap all free-text inputs — protects against runaway prompt size/cost from
+    // very large uploaded documents, full job listing pages, or long notes.
     // Gemini doesn't need more than this to write a focused 3-paragraph letter.
     const trimmedProfileText = profileText.slice(0, 8000)
     const trimmedJobDescription = jobDescription.slice(0, 8000)
+    const trimmedNotes = (notes || '').slice(0, 1000)
 
     const prompt = buildPrompt({
       fullName,
@@ -89,6 +90,7 @@ export default {
       profileText: trimmedProfileText,
       companyName,
       jobDescription: trimmedJobDescription,
+      notes: trimmedNotes,
     })
 
     try {
