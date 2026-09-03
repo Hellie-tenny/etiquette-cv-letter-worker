@@ -1,8 +1,9 @@
 // Etiquette CV — AI cover letter proxy
-// Handles two actions:
-//   "extract"  — pulls job title + company name out of a pasted job listing
-//   "generate" — writes the full cover letter (default if no action given)
-// The Gemini key never touches the browser — both actions call Gemini
+// Handles three actions:
+//   "extract"        — pulls job title, company, and apply instructions out of a pasted job listing
+//   "extractContact"  — pulls email/phone/address out of an uploaded CV, for the letterhead
+//   "generate"        — writes the cover letter body (default if no action given)
+// The Gemini key never touches the browser — all actions call Gemini
 // server-side, using a key stored only in this Worker's secrets.
 
 const ALLOWED_ORIGINS = [
@@ -101,6 +102,34 @@ Rules:
 - Output ONLY the three body paragraphs, nothing else — no greeting, no closing, no signature, no subject line, no markdown formatting.`
 }
 
+function parseJsonFromGemini(raw) {
+  // Gemini sometimes wraps JSON in markdown fences despite instructions not to.
+  const cleaned = raw.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '').trim()
+  try {
+    return JSON.parse(cleaned)
+  } catch {
+    console.error('JSON parse failed:', cleaned)
+    return null
+  }
+}
+
+function buildContactExtractPrompt(cvText) {
+  return `Extract the candidate's contact details from the CV/resume text below.
+
+Respond with ONLY a JSON object, no markdown formatting, no code fences, no explanation — exactly this shape:
+{"email": "...", "phone": "...", "address": "..."}
+
+Field rules:
+- email: the candidate's email address, copied exactly as it appears. Empty string "" if none is present.
+- phone: the candidate's phone number, copied exactly as it appears. Empty string "" if none is present.
+- address: the candidate's postal/physical address (e.g. organization name, P.O. Box, city) if present — copy it as a short comma-separated line. Empty string "" if none is present.
+
+Never invent or guess a value that isn't actually in the text.
+
+CV/resume text:
+${cvText}`
+}
+
 async function handleExtract(body, env, origin) {
   const { jobText } = body
 
@@ -116,14 +145,8 @@ async function handleExtract(body, env, origin) {
       temperature: 0.1,
     })
 
-    // Gemini sometimes wraps JSON in markdown fences despite instructions not to.
-    const cleaned = raw.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '').trim()
-
-    let parsed
-    try {
-      parsed = JSON.parse(cleaned)
-    } catch {
-      console.error('Extract JSON parse failed:', cleaned)
+    const parsed = parseJsonFromGemini(raw)
+    if (!parsed) {
       return jsonResponse({ jobTitle: '', companyName: '' }, 200, origin)
     }
 
@@ -144,6 +167,41 @@ async function handleExtract(body, env, origin) {
       502,
       origin,
     )
+  }
+}
+
+async function handleExtractContact(body, env, origin) {
+  const { cvText } = body
+
+  if (!cvText || cvText.trim().length < 30) {
+    return jsonResponse({ email: '', phone: '', address: '' }, 200, origin)
+  }
+
+  const trimmedCvText = cvText.slice(0, 8000)
+
+  try {
+    const raw = await callGemini(env, buildContactExtractPrompt(trimmedCvText), {
+      maxOutputTokens: 150,
+      temperature: 0.1,
+    })
+
+    const parsed = parseJsonFromGemini(raw)
+    if (!parsed) {
+      return jsonResponse({ email: '', phone: '', address: '' }, 200, origin)
+    }
+
+    return jsonResponse(
+      {
+        email: typeof parsed.email === 'string' ? parsed.email.trim() : '',
+        phone: typeof parsed.phone === 'string' ? parsed.phone.trim() : '',
+        address: typeof parsed.address === 'string' ? parsed.address.trim() : '',
+      },
+      200,
+      origin,
+    )
+  } catch {
+    // Non-critical — just fall back to empty, manual entry still works.
+    return jsonResponse({ email: '', phone: '', address: '' }, 200, origin)
   }
 }
 
@@ -202,6 +260,10 @@ export default {
 
     if (body.action === 'extract') {
       return handleExtract(body, env, origin)
+    }
+
+    if (body.action === 'extractContact') {
+      return handleExtractContact(body, env, origin)
     }
 
     return handleGenerate(body, env, origin)
