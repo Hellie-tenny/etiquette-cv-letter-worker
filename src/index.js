@@ -1,6 +1,9 @@
 // Etiquette CV — AI cover letter proxy
-// Takes CV data + job info from the client, calls Gemini server-side
-// (so the API key never touches the browser), returns the generated letter.
+// Handles two actions:
+//   "extract"  — pulls job title + company name out of a pasted job listing
+//   "generate" — writes the full cover letter (default if no action given)
+// The Gemini key never touches the browser — both actions call Gemini
+// server-side, using a key stored only in this Worker's secrets.
 
 const ALLOWED_ORIGINS = [
   'https://ettiquette-cv.web.app',
@@ -16,8 +19,63 @@ function corsHeaders(origin) {
   }
 }
 
-function buildPrompt({ fullName, jobTitle, profileText, companyName, jobDescription, notes }) {
-  return `You are a professional career writing assistant. Write a concise, tailored cover letter based on the details below.
+function jsonResponse(data, status, origin) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { 'Content-Type': 'application/json', ...corsHeaders(origin) },
+  })
+}
+
+async function callGemini(env, prompt, { maxOutputTokens, temperature }) {
+  const res = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${env.GEMINI_API_KEY}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: {
+          temperature,
+          maxOutputTokens,
+          thinkingConfig: { thinkingBudget: 0 },
+        },
+      }),
+    },
+  )
+
+  if (!res.ok) {
+    const errText = await res.text()
+    console.error('Gemini API error:', res.status, errText)
+    throw new Error('gemini_error')
+  }
+
+  const data = await res.json()
+  const text = data?.candidates?.[0]?.content?.parts?.[0]?.text
+  if (!text) throw new Error('gemini_empty')
+  return text.trim()
+}
+
+function buildExtractPrompt(jobText) {
+  return `Extract details from the job listing text below. The text may include navigation menus, "Apply Now" buttons, cookie notices, or other unrelated page content — ignore all of that.
+
+Respond with ONLY a JSON object, no markdown formatting, no code fences, no explanation — exactly this shape:
+{"jobTitle": "...", "companyName": "...", "applyMethod": "...", "applyInstructions": "...", "applyContact": "..."}
+
+Field rules:
+- jobTitle: the role's title. Empty string "" if not identifiable.
+- companyName: the hiring company. Empty string "" if not mentioned or you're not confident.
+- applyMethod: one of "email", "link", "address", "other", or "" if the text doesn't describe how to apply.
+- applyInstructions: a short, plain-language summary of how to apply (e.g. "Email your CV and cover letter with the subject line 'IT Officer Application'" or "Apply through the online portal"). Empty string "" if no application method is described.
+- applyContact: the literal email address, URL, or physical address to apply to or through — copied EXACTLY as it appears in the text. Empty string "" if none is present. Never invent, guess, or complete a partial contact detail — only include one if it appears verbatim in the text.
+
+Never guess or invent any value you're not reasonably confident about — use empty strings instead.
+
+Job listing text:
+${jobText}`
+}
+
+function buildLetterPrompt({ fullName, jobTitle, profileText, companyName, jobDescription, notes }) {
+  return `You are a professional career writing assistant. Write the BODY of a cover letter based on the details below. Do NOT include a greeting ("Dear..."), a closing ("Sincerely..."), a subject line, or the candidate's name — only the body paragraphs. Those parts are added separately by the application, not by you.
 
 Candidate name: ${fullName}
 Target role: ${jobTitle}
@@ -29,7 +87,7 @@ ${profileText}
 Job posting (this may be a clean job description, or the full text of a job listing page — including navigation text, "Apply Now" buttons, company boilerplate, cookie notices, or other unrelated page content. Identify and use only the actual role details: responsibilities, requirements, and qualifications. Ignore everything else):
 ${jobDescription}
 ${notes ? `\nAdditional instructions from the candidate — follow these unless they conflict with the rules below:\n${notes}\n` : ''}
-Write the cover letter in exactly three paragraphs:
+Write exactly three body paragraphs, separated by a blank line:
 1. A brief, specific opening stating the role and why the candidate is a strong fit.
 2. A paragraph connecting the candidate's actual experience and skills to the specific requirements in the job description — be concrete, not generic.
 3. A short closing paragraph expressing interest in an interview.
@@ -40,7 +98,87 @@ Rules:
 - If the CV/background text is messy (e.g. extracted from a PDF), extract the relevant facts and ignore formatting artifacts, headers, or page numbers.
 - If the job posting text contains unrelated page content (navigation, boilerplate, unrelated postings), extract only the details relevant to this specific role and ignore the rest.
 - Keep the tone professional and confident, not flowery, unless the candidate's additional instructions above say otherwise.
-- Output only the letter text, no preamble, no markdown formatting, no subject line.`
+- Output ONLY the three body paragraphs, nothing else — no greeting, no closing, no signature, no subject line, no markdown formatting.`
+}
+
+async function handleExtract(body, env, origin) {
+  const { jobText } = body
+
+  if (!jobText || jobText.trim().length < 30) {
+    return jsonResponse({ error: 'Paste a bit more of the job listing first.' }, 400, origin)
+  }
+
+  const trimmedJobText = jobText.slice(0, 8000)
+
+  try {
+    const raw = await callGemini(env, buildExtractPrompt(trimmedJobText), {
+      maxOutputTokens: 200,
+      temperature: 0.1,
+    })
+
+    // Gemini sometimes wraps JSON in markdown fences despite instructions not to.
+    const cleaned = raw.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '').trim()
+
+    let parsed
+    try {
+      parsed = JSON.parse(cleaned)
+    } catch {
+      console.error('Extract JSON parse failed:', cleaned)
+      return jsonResponse({ jobTitle: '', companyName: '' }, 200, origin)
+    }
+
+    return jsonResponse(
+      {
+        jobTitle: typeof parsed.jobTitle === 'string' ? parsed.jobTitle.trim() : '',
+        companyName: typeof parsed.companyName === 'string' ? parsed.companyName.trim() : '',
+        applyMethod: typeof parsed.applyMethod === 'string' ? parsed.applyMethod.trim() : '',
+        applyInstructions: typeof parsed.applyInstructions === 'string' ? parsed.applyInstructions.trim() : '',
+        applyContact: typeof parsed.applyContact === 'string' ? parsed.applyContact.trim() : '',
+      },
+      200,
+      origin,
+    )
+  } catch {
+    return jsonResponse(
+      { error: 'Could not read details from that listing. You can fill them in manually.' },
+      502,
+      origin,
+    )
+  }
+}
+
+async function handleGenerate(body, env, origin) {
+  const { fullName, jobTitle, profileText, companyName, jobDescription, notes } = body
+
+  if (!fullName || !jobTitle || !profileText || !jobDescription) {
+    return jsonResponse({ error: 'Missing required fields' }, 400, origin)
+  }
+
+  // Cap all free-text inputs — protects against runaway prompt size/cost from
+  // very large uploaded documents, full job listing pages, or long notes.
+  const trimmedProfileText = profileText.slice(0, 8000)
+  const trimmedJobDescription = jobDescription.slice(0, 8000)
+  const trimmedNotes = (notes || '').slice(0, 1000)
+
+  const prompt = buildLetterPrompt({
+    fullName,
+    jobTitle,
+    profileText: trimmedProfileText,
+    companyName,
+    jobDescription: trimmedJobDescription,
+    notes: trimmedNotes,
+  })
+
+  try {
+    const letter = await callGemini(env, prompt, { maxOutputTokens: 1000, temperature: 0.7 })
+    return jsonResponse({ letter }, 200, origin)
+  } catch {
+    return jsonResponse(
+      { error: 'The AI service is temporarily unavailable. Please try again shortly.' },
+      502,
+      origin,
+    )
+  }
 }
 
 export default {
@@ -52,93 +190,20 @@ export default {
     }
 
     if (request.method !== 'POST') {
-      return new Response(JSON.stringify({ error: 'Method not allowed' }), {
-        status: 405,
-        headers: { 'Content-Type': 'application/json', ...corsHeaders(origin) },
-      })
+      return jsonResponse({ error: 'Method not allowed' }, 405, origin)
     }
 
     let body
     try {
       body = await request.json()
     } catch {
-      return new Response(JSON.stringify({ error: 'Invalid JSON body' }), {
-        status: 400,
-        headers: { 'Content-Type': 'application/json', ...corsHeaders(origin) },
-      })
+      return jsonResponse({ error: 'Invalid JSON body' }, 400, origin)
     }
 
-    const { fullName, jobTitle, profileText, companyName, jobDescription, notes } = body
-
-    if (!fullName || !jobTitle || !profileText || !jobDescription) {
-      return new Response(
-        JSON.stringify({ error: 'Missing required fields' }),
-        { status: 400, headers: { 'Content-Type': 'application/json', ...corsHeaders(origin) } },
-      )
+    if (body.action === 'extract') {
+      return handleExtract(body, env, origin)
     }
 
-    // Cap all free-text inputs — protects against runaway prompt size/cost from
-    // very large uploaded documents, full job listing pages, or long notes.
-    // Gemini doesn't need more than this to write a focused 3-paragraph letter.
-    const trimmedProfileText = profileText.slice(0, 8000)
-    const trimmedJobDescription = jobDescription.slice(0, 8000)
-    const trimmedNotes = (notes || '').slice(0, 1000)
-
-    const prompt = buildPrompt({
-      fullName,
-      jobTitle,
-      profileText: trimmedProfileText,
-      companyName,
-      jobDescription: trimmedJobDescription,
-      notes: trimmedNotes,
-    })
-
-    try {
-      const geminiRes = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${env.GEMINI_API_KEY}`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            contents: [{ parts: [{ text: prompt }] }],
-            generationConfig: {
-              temperature: 0.7,
-              maxOutputTokens: 1000,
-              thinkingConfig: { thinkingBudget: 0 },
-            },
-          }),
-        },
-      )
-
-      if (!geminiRes.ok) {
-        const errText = await geminiRes.text()
-        console.error('Gemini API error:', geminiRes.status, errText)
-        return new Response(
-          JSON.stringify({ error: 'The AI service is temporarily unavailable. Please try again shortly.' }),
-          { status: 502, headers: { 'Content-Type': 'application/json', ...corsHeaders(origin) } },
-        )
-      }
-
-      const data = await geminiRes.json()
-      const letter = data?.candidates?.[0]?.content?.parts?.[0]?.text
-
-      if (!letter) {
-        return new Response(
-          JSON.stringify({ error: 'The AI did not return any content. Please try again.' }),
-          { status: 502, headers: { 'Content-Type': 'application/json', ...corsHeaders(origin) } },
-        )
-      }
-
-      return new Response(JSON.stringify({ letter: letter.trim() }), {
-        status: 200,
-        headers: { 'Content-Type': 'application/json', ...corsHeaders(origin) },
-      })
-    } catch (err) {
-      console.error('Worker error:', err)
-      return new Response(
-        JSON.stringify({ error: 'Something went wrong generating the letter.' }),
-        { status: 500, headers: { 'Content-Type': 'application/json', ...corsHeaders(origin) } },
-      )
-    }
+    return handleGenerate(body, env, origin)
   },
 }
