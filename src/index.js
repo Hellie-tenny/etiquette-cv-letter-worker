@@ -1,8 +1,10 @@
 // Etiquette CV — AI cover letter proxy
 // Handles three actions:
-//   "extract"        — pulls job title, company, and apply instructions out of a pasted job listing
-//   "extractContact"  — pulls email/phone/address out of an uploaded CV, for the letterhead
-//   "generate"        — writes the cover letter body (default if no action given)
+//   "extract"         — pulls job title, company, and apply instructions out
+//                        of a pasted job listing (jobText) OR a photo/screenshot
+//                        of one (jobImage: { data, mimeType })
+//   "extractContact"  — pulls name/email/phone/address out of an uploaded CV
+//   "generate"         — writes the cover letter body (default if no action given)
 // The Gemini key never touches the browser — all actions call Gemini
 // server-side, using a key stored only in this Worker's secrets.
 
@@ -27,14 +29,20 @@ function jsonResponse(data, status, origin) {
   })
 }
 
-async function callGemini(env, prompt, { maxOutputTokens, temperature }) {
+async function callGemini(env, prompt, { maxOutputTokens, temperature, image }) {
+  const parts = []
+  if (image) {
+    parts.push({ inlineData: { mimeType: image.mimeType, data: image.data } })
+  }
+  parts.push({ text: prompt })
+
   const res = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${env.GEMINI_API_KEY}`,
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }] }],
+        contents: [{ parts }],
         generationConfig: {
           temperature,
           maxOutputTokens,
@@ -73,6 +81,23 @@ Never guess or invent any value you're not reasonably confident about — use em
 
 Job listing text:
 ${jobText}`
+}
+
+function buildExtractFromImagePrompt() {
+  return `This image contains a job vacancy or job listing (e.g. a screenshot, flyer, or photo of a notice). Read the text visible in the image and extract the following. Ignore watermarks, logos, decorative elements, or content unrelated to the job itself.
+
+Respond with ONLY a JSON object, no markdown formatting, no code fences, no explanation — exactly this shape:
+{"extractedText": "...", "jobTitle": "...", "companyName": "...", "applyMethod": "...", "applyInstructions": "...", "applyContact": "..."}
+
+Field rules:
+- extractedText: a plain-text transcription of the job-relevant content in the image — the role, responsibilities, requirements, qualifications. Leave out navigation, decorative elements, or unrelated text. If the image doesn't contain a readable job listing at all, use an empty string "".
+- jobTitle: the role's title. Empty string "" if not identifiable.
+- companyName: the hiring company. Empty string "" if not mentioned or you're not confident.
+- applyMethod: one of "email", "link", "address", "other", or "" if not described.
+- applyInstructions: a short, plain-language summary of how to apply. Empty string "" if not described.
+- applyContact: the literal email address, URL, or physical address to apply to — copied EXACTLY as it appears. Empty string "" if none is present. Never invent or guess.
+
+Never guess or invent any value you're not reasonably confident about — use empty strings instead.`
 }
 
 function buildLetterPrompt({ fullName, jobTitle, profileText, companyName, jobDescription, notes }) {
@@ -117,9 +142,10 @@ function buildContactExtractPrompt(cvText) {
   return `Extract the candidate's contact details from the CV/resume text below.
 
 Respond with ONLY a JSON object, no markdown formatting, no code fences, no explanation — exactly this shape:
-{"email": "...", "phone": "...", "address": "..."}
+{"fullName": "...", "email": "...", "phone": "...", "address": "..."}
 
 Field rules:
+- fullName: the candidate's full name, as it appears at or near the top of the document. Empty string "" if you're not confident.
 - email: the candidate's email address, copied exactly as it appears. Empty string "" if none is present.
 - phone: the candidate's phone number, copied exactly as it appears. Empty string "" if none is present.
 - address: the candidate's postal/physical address (e.g. organization name, P.O. Box, city) if present — copy it as a short comma-separated line. Empty string "" if none is present.
@@ -130,8 +156,64 @@ CV/resume text:
 ${cvText}`
 }
 
+const MAX_IMAGE_BASE64_LENGTH = 7 * 1024 * 1024 // ~5MB raw file, base64-encoded
+
 async function handleExtract(body, env, origin) {
-  const { jobText } = body
+  const { jobText, jobImage } = body
+
+  if (jobImage) {
+    if (!jobImage.data || !jobImage.mimeType) {
+      return jsonResponse({ error: 'That image could not be read. Please try another.' }, 400, origin)
+    }
+    if (jobImage.data.length > MAX_IMAGE_BASE64_LENGTH) {
+      return jsonResponse({ error: 'That image is too large. Please upload something under 5MB.' }, 400, origin)
+    }
+
+    try {
+      const raw = await callGemini(env, buildExtractFromImagePrompt(), {
+        maxOutputTokens: 1200,
+        temperature: 0.1,
+        image: { mimeType: jobImage.mimeType, data: jobImage.data },
+      })
+
+      const parsed = parseJsonFromGemini(raw)
+      if (!parsed) {
+        return jsonResponse(
+          { error: "Couldn't read that image clearly. Try a clearer photo, or paste the text instead." },
+          200,
+          origin,
+        )
+      }
+
+      const extractedText = typeof parsed.extractedText === 'string' ? parsed.extractedText.trim() : ''
+      if (!extractedText) {
+        return jsonResponse(
+          { error: "Couldn't find a job listing in that image. Try a clearer photo, or paste the text instead." },
+          200,
+          origin,
+        )
+      }
+
+      return jsonResponse(
+        {
+          extractedText,
+          jobTitle: typeof parsed.jobTitle === 'string' ? parsed.jobTitle.trim() : '',
+          companyName: typeof parsed.companyName === 'string' ? parsed.companyName.trim() : '',
+          applyMethod: typeof parsed.applyMethod === 'string' ? parsed.applyMethod.trim() : '',
+          applyInstructions: typeof parsed.applyInstructions === 'string' ? parsed.applyInstructions.trim() : '',
+          applyContact: typeof parsed.applyContact === 'string' ? parsed.applyContact.trim() : '',
+        },
+        200,
+        origin,
+      )
+    } catch {
+      return jsonResponse(
+        { error: 'Could not read that image. Please try again, or paste the text instead.' },
+        502,
+        origin,
+      )
+    }
+  }
 
   if (!jobText || jobText.trim().length < 30) {
     return jsonResponse({ error: 'Paste a bit more of the job listing first.' }, 400, origin)
@@ -174,7 +256,7 @@ async function handleExtractContact(body, env, origin) {
   const { cvText } = body
 
   if (!cvText || cvText.trim().length < 30) {
-    return jsonResponse({ email: '', phone: '', address: '' }, 200, origin)
+    return jsonResponse({ fullName: '', email: '', phone: '', address: '' }, 200, origin)
   }
 
   const trimmedCvText = cvText.slice(0, 8000)
@@ -187,11 +269,12 @@ async function handleExtractContact(body, env, origin) {
 
     const parsed = parseJsonFromGemini(raw)
     if (!parsed) {
-      return jsonResponse({ email: '', phone: '', address: '' }, 200, origin)
+      return jsonResponse({ fullName: '', email: '', phone: '', address: '' }, 200, origin)
     }
 
     return jsonResponse(
       {
+        fullName: typeof parsed.fullName === 'string' ? parsed.fullName.trim() : '',
         email: typeof parsed.email === 'string' ? parsed.email.trim() : '',
         phone: typeof parsed.phone === 'string' ? parsed.phone.trim() : '',
         address: typeof parsed.address === 'string' ? parsed.address.trim() : '',
@@ -201,7 +284,7 @@ async function handleExtractContact(body, env, origin) {
     )
   } catch {
     // Non-critical — just fall back to empty, manual entry still works.
-    return jsonResponse({ email: '', phone: '', address: '' }, 200, origin)
+    return jsonResponse({ fullName: '', email: '', phone: '', address: '' }, 200, origin)
   }
 }
 
