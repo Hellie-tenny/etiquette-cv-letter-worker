@@ -1,6 +1,8 @@
 // Etiquette CV — AI cover letter proxy
 // Handles three actions:
 //   "extract"        — pulls job title, company, and apply instructions out of a pasted job listing
+//                     (text or a photo). With purpose:"posting" it also returns location, employment
+//                     type, closing date, and a cleaned description for the Post a Job form.
 //   "extractContact"  — pulls email/phone/address out of an uploaded CV, for the letterhead
 //   "generate"        — writes the cover letter body (default if no action given)
 // The Gemini key never touches the browser — all actions call Gemini
@@ -27,14 +29,16 @@ function jsonResponse(data, status, origin) {
   })
 }
 
-async function callGemini(env, prompt, { maxOutputTokens, temperature }) {
+async function callGemini(env, promptOrParts, { maxOutputTokens, temperature }) {
+  const parts = typeof promptOrParts === 'string' ? [{ text: promptOrParts }] : promptOrParts
+
   const res = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${env.GEMINI_API_KEY}`,
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }] }],
+        contents: [{ parts }],
         generationConfig: {
           temperature,
           maxOutputTokens,
@@ -73,6 +77,74 @@ Never guess or invent any value you're not reasonably confident about — use em
 
 Job listing text:
 ${jobText}`
+}
+
+const EMPLOYMENT_TYPES = ['Full-time', 'Part-time', 'Contract', 'Internship']
+const DESCRIPTION_DELIMITER = '===DESCRIPTION==='
+
+// Used for job photos (any caller) and for pasted text from the Post a Job form.
+// The cleaned description comes AFTER a delimiter instead of inside the JSON, so a
+// long multi-line description can't break JSON escaping or get the JSON cut off.
+function buildFullExtractPrompt({ today, jobText }) {
+  const source = jobText
+    ? `the job listing text at the bottom of this message`
+    : `the attached image of a job vacancy`
+  return `Read ${source} and extract the details below. The source may contain navigation menus, "Apply Now" buttons, cookie notices, share links, unrelated postings, or other page clutter — ignore all of that.
+
+Today's date is ${today}.
+
+Respond in exactly this layout:
+1) A single-line JSON object — no markdown, no code fences — with exactly these keys:
+{"jobTitle": "", "companyName": "", "location": "", "employmentType": "", "closingDate": "", "applyMethod": "", "applyInstructions": "", "applyContact": ""}
+2) A line containing only: ${DESCRIPTION_DELIMITER}
+3) The cleaned job description as plain text.
+
+JSON field rules:
+- jobTitle: the role's title. "" if not identifiable.
+- companyName: the hiring organisation. "" if not mentioned or you're not confident.
+- location: the job's location (city/town/district), short. "" if not stated.
+- employmentType: exactly one of ${EMPLOYMENT_TYPES.map((t) => `"${t}"`).join(', ')}, or "" if not stated. Map fixed-term/temporary/consultancy to "Contract"; attachment/traineeship/internship to "Internship".
+- closingDate: the application deadline as YYYY-MM-DD, or "" if none is stated. Dates in the source are usually written day-first (e.g. 05/11/2026 is 5 November 2026). If the year is missing, use the next occurrence of that date on or after today. Never invent a date.
+- applyMethod: one of "email", "link", "address", "other", or "" if the source doesn't say how to apply.
+- applyInstructions: plain-language instructions on how to apply, keeping every specific requirement (subject line, documents to attach, what to include). "" if none.
+- applyContact: the literal email address, URL, or postal address to apply through, copied EXACTLY as written. "" if none. Never invent, guess, or complete a partial contact detail.
+
+Description rules:
+- Include only the actual job content: about the role/organisation, duties and responsibilities, requirements, qualifications, skills, salary and benefits if stated.
+- Leave out the how-to-apply paragraph and the closing-date sentence (they are captured above), and all page clutter.
+- Keep the original wording — do not summarise, rewrite, or add anything. Fix only obvious line-break and spacing damage from copy/paste or OCR.
+- Plain text only, no markdown symbols. Separate sections with a blank line. Use "- " at the start of each bullet item.
+
+Never guess a value you're not reasonably confident about — use "" instead.
+${jobText ? `\nJob listing text:\n${jobText}` : ''}`
+}
+
+function parseFullExtract(raw) {
+  const idx = raw.indexOf(DESCRIPTION_DELIMITER)
+  const jsonPart = idx >= 0 ? raw.slice(0, idx) : raw
+  const descPart = idx >= 0 ? raw.slice(idx + DESCRIPTION_DELIMITER.length) : ''
+  const fields = parseJsonFromGemini(jsonPart)
+  if (!fields) return null
+  const description = descPart.replace(/^\s*\n/, '').replace(/```\s*$/, '').trim()
+  return { fields, description }
+}
+
+function str(v) {
+  return typeof v === 'string' ? v.trim() : ''
+}
+
+function normalizeEmploymentType(v) {
+  const key = str(v).toLowerCase().replace(/[^a-z]/g, '')
+  const map = { fulltime: 'Full-time', parttime: 'Part-time', contract: 'Contract', internship: 'Internship' }
+  return map[key] || ''
+}
+
+// Accepts only a real calendar date in YYYY-MM-DD form.
+function normalizeDate(v) {
+  const s = str(v)
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return ''
+  const d = new Date(`${s}T00:00:00Z`)
+  return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === s ? s : ''
 }
 
 function buildLetterPrompt({ fullName, jobTitle, profileText, companyName, jobDescription, notes }) {
@@ -131,12 +203,40 @@ ${cvText}`
 }
 
 async function handleExtract(body, env, origin) {
-  const { jobText } = body
+  const { jobText, jobImage, purpose } = body
+  const isPosting = purpose === 'posting'
+
+  // ── Photo of a vacancy (cover letter tool and Post a Job) ──
+  if (jobImage) {
+    const { data, mimeType } = jobImage
+    if (
+      typeof data !== 'string' ||
+      !data ||
+      typeof mimeType !== 'string' ||
+      !mimeType.startsWith('image/') ||
+      data.length > 7_500_000 // ~5MB file once base64-encoded
+    ) {
+      return jsonResponse({ error: 'That image could not be read. Try a different one.' }, 400, origin)
+    }
+    return runFullExtract(
+      env,
+      origin,
+      [{ text: buildFullExtractPrompt({ today: todayISO(), jobText: '' }) }, { inline_data: { mime_type: mimeType, data } }],
+      '',
+    )
+  }
 
   if (!jobText || jobText.trim().length < 30) {
     return jsonResponse({ error: 'Paste a bit more of the job listing first.' }, 400, origin)
   }
 
+  // ── Pasted text from the Post a Job form: full extraction + cleaned description ──
+  if (isPosting) {
+    const trimmed = jobText.slice(0, 12000)
+    return runFullExtract(env, origin, buildFullExtractPrompt({ today: todayISO(), jobText: trimmed }), trimmed)
+  }
+
+  // ── Pasted text from the cover letter tool: unchanged lightweight extraction ──
   const trimmedJobText = jobText.slice(0, 8000)
 
   try {
@@ -152,11 +252,60 @@ async function handleExtract(body, env, origin) {
 
     return jsonResponse(
       {
-        jobTitle: typeof parsed.jobTitle === 'string' ? parsed.jobTitle.trim() : '',
-        companyName: typeof parsed.companyName === 'string' ? parsed.companyName.trim() : '',
-        applyMethod: typeof parsed.applyMethod === 'string' ? parsed.applyMethod.trim() : '',
-        applyInstructions: typeof parsed.applyInstructions === 'string' ? parsed.applyInstructions.trim() : '',
-        applyContact: typeof parsed.applyContact === 'string' ? parsed.applyContact.trim() : '',
+        jobTitle: str(parsed.jobTitle),
+        companyName: str(parsed.companyName),
+        applyMethod: str(parsed.applyMethod),
+        applyInstructions: str(parsed.applyInstructions),
+        applyContact: str(parsed.applyContact),
+      },
+      200,
+      origin,
+    )
+  } catch {
+    return jsonResponse(
+      { error: 'Could not read details from that listing. You can fill them in manually.' },
+      502,
+      origin,
+    )
+  }
+}
+
+function todayISO() {
+  return new Date().toISOString().slice(0, 10)
+}
+
+// Shared by the photo path and the Post a Job paste path.
+// sourceText is the pasted text (so contact details can be verified against it); '' for images.
+async function runFullExtract(env, origin, promptOrParts, sourceText) {
+  try {
+    const raw = await callGemini(env, promptOrParts, { maxOutputTokens: 4096, temperature: 0.1 })
+    const result = parseFullExtract(raw)
+    if (!result) {
+      return jsonResponse(
+        { error: 'Could not read details from that listing. You can fill them in manually.' },
+        502,
+        origin,
+      )
+    }
+
+    const f = result.fields
+    let applyContact = str(f.applyContact)
+    // Pasted text lets us check that the contact detail really appears in it.
+    if (sourceText && applyContact && !sourceText.toLowerCase().includes(applyContact.toLowerCase())) {
+      applyContact = ''
+    }
+
+    return jsonResponse(
+      {
+        jobTitle: str(f.jobTitle),
+        companyName: str(f.companyName),
+        location: str(f.location),
+        employmentType: normalizeEmploymentType(f.employmentType),
+        closingDate: normalizeDate(f.closingDate),
+        applyMethod: applyContact ? str(f.applyMethod) : '',
+        applyInstructions: str(f.applyInstructions),
+        applyContact,
+        extractedText: result.description,
       },
       200,
       origin,
